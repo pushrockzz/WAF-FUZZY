@@ -105,7 +105,7 @@ jobs:
         run: |
           echo "This runner is responsible for wordlist chunk: ${{ matrix.wordlist_chunk }}"
           echo "Targets to be scanned:"
-          cat targets.txt
+          cat target.txt
           
       - name: Run Feroxbuster on All Targets with Assigned Wordlist Chunk
         id: run_feroxbuster
@@ -114,7 +114,7 @@ jobs:
           CHUNK_BASENAME=$(basename "${{ matrix.wordlist_chunk }}")
           OUTPUT_FILE="results_${CHUNK_BASENAME}.txt"
           
-          echo "-> Running feroxbuster against targets in 'targets.txt'..."
+          echo "-> Running feroxbuster against targets in 'target.txt'..."
           echo "-> Using wordlist: ${{ matrix.wordlist_chunk }}"
           echo "-> Saving output to: $OUTPUT_FILE"
 
@@ -126,7 +126,7 @@ jobs:
               echo "Scanning $target_url..."
               feroxbuster -u "$target_url" --wordlist "${{ matrix.wordlist_chunk }}" --random-agent --output "$OUTPUT_FILE" --quiet
             fi
-          done < targets.txt
+          done < target.txt
 
           echo "output_path=$OUTPUT_FILE" >> "$GITHUB_OUTPUT"
 

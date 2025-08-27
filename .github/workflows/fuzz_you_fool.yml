@@ -1,14 +1,16 @@
 name: Fuzz Again and Again
 
 on:
-  workflow_dispatch: 
+  workflow_dispatch:
 
 permissions:
-  contents: write # We only need to read the repository contents
+  contents: read # Only needs to read the repo contents
+  actions: write # Required for uploading artifacts
 
 jobs:
-  prepare-chunks:
-    name: Prepare Chunks and Build Matrix
+  # Job 1: Split the wordlist into manageable chunks
+  prepare-wordlist-chunks:
+    name: Prepare Wordlist Chunks
     runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.build_matrix.outputs.matrix }}
@@ -17,176 +19,165 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Install jq
+      - name: Install jq for JSON processing
         run: sudo apt-get update && sudo apt-get install -y jq
 
-      - name: Create Chunks and Build Matrix
+      - name: Create Wordlist Chunks and Build Matrix
         id: build_matrix
         shell: bash
         run: |
 
-          # --- 1. CONFIGURATION AND SETUP ---
-          INPUT_FILE="target.txt"
-          CHUNK_SIZE=100
-          CHUNK_DIR="chunks"
-          if [ ! -f "$INPUT_FILE" ]; then
-            echo "::error::Input file '$INPUT_FILE' not found in the repository root."
+          wget -qO wordlist.txt https://raw.githubusercontent.com/danielmiessler/SecLists/refs/heads/master/Discovery/Web-Content/raft-small-words-lowercase.txt
+          WORDLIST_FILE="wordlist.txt"
+          CHUNK_SIZE=5000 # Adjust this number based on your wordlist size and desired parallelism
+          CHUNK_DIR="wordlist-chunks"
+
+          # --- Validation ---
+          if [ ! -f "$WORDLIST_FILE" ]; then
+            echo "::error::Wordlist file '$WORDLIST_FILE' not found in the repository root."
             exit 0
           fi
+
+          # --- Splitting Logic ---
           mkdir -p "$CHUNK_DIR"
-          echo "-> Splitting '$INPUT_FILE' into chunks of $CHUNK_SIZE lines..."
-          split -l "$CHUNK_SIZE" -a 3 --numeric-suffixes=1 "$INPUT_FILE" "$CHUNK_DIR/chunk_"
+          echo "-> Splitting '$WORDLIST_FILE' into chunks of $CHUNK_SIZE lines each..."
+          split -l "$CHUNK_SIZE" -a 3 --numeric-suffixes=1 "$WORDLIST_FILE" "$CHUNK_DIR/chunk_"
           
           echo "-> Chunk files created in '$CHUNK_DIR' directory:"
-          ls -l "$CHUNK_DIR"
+          ls -lh "$CHUNK_DIR"
           
-          # --- 2. COUNT THE CHUNKS ---
-
+          # --- Count Chunks ---
           CHUNK_COUNT=$(find "$CHUNK_DIR" -type f -name 'chunk_*' | wc -l)
           if [ "$CHUNK_COUNT" -eq 0 ]; then
             echo "::warning::Splitting produced 0 chunk files. No work to do."
+            # Set empty outputs to prevent the next job from running
             echo "matrix=[]" >> "$GITHUB_OUTPUT"
             echo "chunk_count=0" >> "$GITHUB_OUTPUT"
-            exit 0 # Exit successfully as there is no work
+            exit 0
           fi
           echo "-> Found $CHUNK_COUNT chunk files to process."
           
-          # --- 3. BUILD THE MATRIX (SIMPLIFIED & DIRECT METHOD) ---
-          # This is the most robust way: list files, pipe to jq to build the JSON.
-          # The jq command transforms each line of input into a JSON object.
-          # The -R (raw input) and -s (slurp) flags read the entire input into a single array.
+          # --- Build JSON Matrix ---
+          # This creates a JSON array of the chunk file paths for the strategy matrix
+          JSON_MATRIX=$(find "$CHUNK_DIR" -type f -name 'chunk_*' | jq --raw-input --slurp --compact-output 'split("\n") | map(select(length > 0))')
           
-          JSON_MATRIX=$(find "$CHUNK_DIR" -type f -name 'chunk_*' | jq -R -s -c 'split("\n") | map(select(length > 0))')
-          # --- 4. VERIFY AND OUTPUT ---
-          echo "-> Verifying that the generated matrix is valid JSON..."
-          echo "$JSON_MATRIX" | jq .
+          echo "-> Generated Matrix: $JSON_MATRIX"
           
-          echo "-> Matrix verification successful."
-          echo "Final Matrix: $JSON_MATRIX"
-          
+          # --- Set Job Outputs ---
           echo "matrix=$JSON_MATRIX" >> "$GITHUB_OUTPUT"
           echo "chunk_count=$CHUNK_COUNT" >> "$GITHUB_OUTPUT"
           
-      - name: Upload Chunks as Artifact
+      - name: Upload Wordlist Chunks as Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: output-chunks
-          path: chunks/
+          name: wordlist-chunks-artifact
+          path: wordlist-chunks/
           retention-days: 1
 
-  run-tools-in-parallel:
-    needs: prepare-chunks
-    if: ${{ needs.prepare-chunks.outputs.chunk_count > 0 }}
+  # Job 2: Run feroxbuster in parallel using the chunks
+  run-feroxbuster-in-parallel:
+    needs: prepare-wordlist-chunks
+    if: ${{ needs.prepare-wordlist-chunks.outputs.chunk_count > 0 }} # Only run if chunks exist
     runs-on: ubuntu-latest
     strategy:
-      fail-fast: false
+      fail-fast: false # Allows other scans to continue even if one fails
       matrix:
+        # Dynamically create a job for each chunk file from the previous job's output
+        wordlist_chunk: ${{ fromJson(needs.prepare-wordlist-chunks.outputs.matrix) }}
 
-        chunk_file: ${{ fromJson(needs.prepare-chunks.outputs.matrix) }}
     steps:
       - name: Checkout Repository
-        uses: actions/checkout@v3
-        with:
+        uses: actions/checkout@v4
 
-          fetch-depth: 0   
-          
-      - name: Setup Go
-        uses: actions/setup-go@v5
-        with:
-          go-version: '1.23'
-
-      - name: Cache Go modules & binaries
-        uses: actions/cache@v3
-        with:
-          path: |
-            $HOME/go/pkg/mod
-            ~/.cache/go-build
-            $HOME/go/bin
-          key: ${{ runner.os }}-go-cache-${{ github.ref_name }}
-          restore-keys: |
-            ${{ runner.os }}-go-cache-
-            
-      - name: Install Tools
-        shell: bash
+      - name: Install Feroxbuster
         run: |
-            
-            curl -sL https://raw.githubusercontent.com/epi052/feroxbuster/main/install-nix.sh | bash
+          curl -sL https://raw.githubusercontent.com/epi052/feroxbuster/main/install-nix.sh | bash
+          sudo mv /home/runner/work/WAF-FUZZY/WAF-FUZZY/feroxbuster /usr/local/bin/
+          echo "Feroxbuster installed at $(which feroxbuster)"
           
-      - name: Download Chunks Artifact
+      - name: Download Wordlist Chunks Artifact
         uses: actions/download-artifact@v4
         with:
-          name: output-chunks
-          path: chunks/
+          name: wordlist-chunks-artifact
+          path: wordlist-chunks/
           
-      - name: Debug Matrix Context
+      - name: Debug Information
         run: |
-          echo "matrix.chunk_file = ${{ matrix.chunk_file }}"
+          echo "This runner is responsible for wordlist chunk: ${{ matrix.wordlist_chunk }}"
+          echo "Targets to be scanned:"
+          cat targets.txt
           
-      - name: Run tools on Chunks
-        id: run_tool
-        shell: bash
-        env:
-          CHUNK_PATH: ${{ matrix.chunk_file }}
+      - name: Run Feroxbuster on All Targets with Assigned Wordlist Chunk
+        id: run_feroxbuster
         run: |
-          set -ex
-          # verify chunk file exists
-          if [ ! -f "$CHUNK_PATH" ]; then
-            echo "::error:: Chunk file '$CHUNK_PATH' not found"
-            ls -R .
-            exit 1
-          fi
+          # Define a unique output file for this runner's results
+          CHUNK_BASENAME=$(basename "${{ matrix.wordlist_chunk }}")
+          OUTPUT_FILE="results_${CHUNK_BASENAME}.txt"
+          
+          echo "-> Running feroxbuster against targets in 'targets.txt'..."
+          echo "-> Using wordlist: ${{ matrix.wordlist_chunk }}"
+          echo "-> Saving output to: $OUTPUT_FILE"
 
-          BASENAME=$(basename "$CHUNK_PATH")
-          echo "basename=$BASENAME" >> $GITHUB_OUTPUT
-          OUTPUT_DIR="results"
-          mkdir -p "$OUTPUT_DIR"
-          OUTPUT_FILE="$OUTPUT_DIR/result_${BASENAME}"
-          echo "Running httpx on $CHUNK_PATH → $OUTPUT_FILE"
-          PUBLIC_IP=$(curl -s https://api.ipify.org) && echo "The public IP of this runner is: $PUBLIC_IP"
-         
-      - name: Compute Safe Chunk Name
-        id: safe_chunk
+          # Loop through each target and run feroxbuster
+
+          while IFS= read -r target_url; do
+            # Skip empty lines in the target file
+            if [ -n "$target_url" ]; then
+              echo "Scanning $target_url..."
+              feroxbuster -u "$target_url" --wordlist "${{ matrix.wordlist_chunk }}" --random-agent --output "$OUTPUT_FILE" --quiet
+            fi
+          done < targets.txt
+
+          echo "output_path=$OUTPUT_FILE" >> "$GITHUB_OUTPUT"
+
+      - name: Create Safe Artifact Name
+        id: safe_name
         run: |
-          SAFE_CHUNK="$(echo "${{ matrix.chunk_file }}" | tr '/' '_')"
-          echo "safe_chunk=$SAFE_CHUNK" >> $GITHUB_OUTPUT
-          
+          # Sanitize the chunk name to be a valid artifact name (replace slashes)
+          SAFE_NAME=$(echo "${{ matrix.wordlist_chunk }}" | tr '/' '_')
+          echo "safe_name=$SAFE_NAME" >> "$GITHUB_OUTPUT"
+
       - name: Upload Individual Result Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: result-${{ steps.safe_chunk.outputs.safe_chunk }}
-          path: ${{ steps.run_tool.outputs.output_file }}
+          name: result-${{ steps.safe_name.outputs.safe_name }}
+          path: ${{ steps.run_feroxbuster.outputs.output_path }}
           retention-days: 1
 
+  # Job 3: Combine all individual results into a final report
   aggregate-results:
-    needs: run-tools-in-parallel
-    if: always() # This ensures the aggregation job runs even if some nuclei jobs fail
+    needs: run-feroxbuster-in-parallel
+    if: always() # This ensures the report is generated even if some scans fail
     runs-on: ubuntu-latest
     steps:
-      - name: Create Temporary Directory for Results
-        run: mkdir -p temp-results
+      - name: Create Directory for Results
+        run: mkdir -p all-results
 
       - name: Download All Result Artifacts
         uses: actions/download-artifact@v4
         with:
-          path: temp-results/
+          path: all-results/
           pattern: result-*
           merge-multiple: true
 
-      - name: Aggregate All Results into a Single File
-        id: aggregate
+      - name: Aggregate and Sort Results
         run: |
           echo "Aggregating all results..."
           
-          # Combine all downloaded result files into one.
-          # The `sort -u` command will also remove any duplicate findings.
+          # Check if any result files were downloaded
+          if [ -z "$(ls -A all-results/)" ]; then
+            echo "No result files found to aggregate. Exiting."
+            exit 0
+          fi
           
-          cat temp-results/* | sort -u > nuclei-final-results.txt
-          echo "Final aggregated results created at nuclei-final-results.txt"
-          echo "Total unique findings: $(wc -l < nuclei-final-results.txt)"
+          # Combine all downloaded result files into one, then sort and remove duplicates
+          cat all-results/results_*.txt | sort -u > feroxbuster-final-report.txt
           
-      - name: Upload Final Aggregated Results
+          echo "✅ Final aggregated report created at feroxbuster-final-report.txt"
+          echo "Total unique findings: $(wc -l < feroxbuster-final-report.txt)"
+          
+      - name: Upload Final Aggregated Report
         uses: actions/upload-artifact@v4
         with:
-          name: final-nuclei-results
-          path: nuclei-final-results.txt
-          retention-days: 1
+          name: final-feroxbuster-report
+          path: feroxbuster-final-report.txt

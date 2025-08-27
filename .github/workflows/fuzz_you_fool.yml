@@ -124,7 +124,7 @@ jobs:
             # Skip empty lines in the target file
             if [ -n "$target_url" ]; then
               echo "Scanning $target_url..."
-              feroxbuster -u "$target_url" --wordlist "${{ matrix.wordlist_chunk }}" --random-agent --output "$OUTPUT_FILE" --quiet
+              feroxbuster -u "$target_url" --wordlist "${{ matrix.wordlist_chunk }}" --random-agent --filter-status 404 307 500 403 --output "$OUTPUT_FILE" --quiet
             fi
           done < target.txt
 

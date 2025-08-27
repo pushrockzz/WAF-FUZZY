@@ -1,0 +1,192 @@
+name: Fuzz Again and Again
+
+on:
+  workflow_dispatch: 
+
+permissions:
+  contents: write # We only need to read the repository contents
+
+jobs:
+  prepare-chunks:
+    name: Prepare Chunks and Build Matrix
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.build_matrix.outputs.matrix }}
+      chunk_count: ${{ steps.build_matrix.outputs.chunk_count }}
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install -y jq
+
+      - name: Create Chunks and Build Matrix
+        id: build_matrix
+        shell: bash
+        run: |
+
+          # --- 1. CONFIGURATION AND SETUP ---
+          INPUT_FILE="target.txt"
+          CHUNK_SIZE=100
+          CHUNK_DIR="chunks"
+          if [ ! -f "$INPUT_FILE" ]; then
+            echo "::error::Input file '$INPUT_FILE' not found in the repository root."
+            exit 0
+          fi
+          mkdir -p "$CHUNK_DIR"
+          echo "-> Splitting '$INPUT_FILE' into chunks of $CHUNK_SIZE lines..."
+          split -l "$CHUNK_SIZE" -a 3 --numeric-suffixes=1 "$INPUT_FILE" "$CHUNK_DIR/chunk_"
+          
+          echo "-> Chunk files created in '$CHUNK_DIR' directory:"
+          ls -l "$CHUNK_DIR"
+          
+          # --- 2. COUNT THE CHUNKS ---
+
+          CHUNK_COUNT=$(find "$CHUNK_DIR" -type f -name 'chunk_*' | wc -l)
+          if [ "$CHUNK_COUNT" -eq 0 ]; then
+            echo "::warning::Splitting produced 0 chunk files. No work to do."
+            echo "matrix=[]" >> "$GITHUB_OUTPUT"
+            echo "chunk_count=0" >> "$GITHUB_OUTPUT"
+            exit 0 # Exit successfully as there is no work
+          fi
+          echo "-> Found $CHUNK_COUNT chunk files to process."
+          
+          # --- 3. BUILD THE MATRIX (SIMPLIFIED & DIRECT METHOD) ---
+          # This is the most robust way: list files, pipe to jq to build the JSON.
+          # The jq command transforms each line of input into a JSON object.
+          # The -R (raw input) and -s (slurp) flags read the entire input into a single array.
+          
+          JSON_MATRIX=$(find "$CHUNK_DIR" -type f -name 'chunk_*' | jq -R -s -c 'split("\n") | map(select(length > 0))')
+          # --- 4. VERIFY AND OUTPUT ---
+          echo "-> Verifying that the generated matrix is valid JSON..."
+          echo "$JSON_MATRIX" | jq .
+          
+          echo "-> Matrix verification successful."
+          echo "Final Matrix: $JSON_MATRIX"
+          
+          echo "matrix=$JSON_MATRIX" >> "$GITHUB_OUTPUT"
+          echo "chunk_count=$CHUNK_COUNT" >> "$GITHUB_OUTPUT"
+          
+      - name: Upload Chunks as Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: output-chunks
+          path: chunks/
+          retention-days: 1
+
+  run-tools-in-parallel:
+    needs: prepare-chunks
+    if: ${{ needs.prepare-chunks.outputs.chunk_count > 0 }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+
+        chunk_file: ${{ fromJson(needs.prepare-chunks.outputs.matrix) }}
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v3
+        with:
+
+          fetch-depth: 0   
+          
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+
+      - name: Cache Go modules & binaries
+        uses: actions/cache@v3
+        with:
+          path: |
+            $HOME/go/pkg/mod
+            ~/.cache/go-build
+            $HOME/go/bin
+          key: ${{ runner.os }}-go-cache-${{ github.ref_name }}
+          restore-keys: |
+            ${{ runner.os }}-go-cache-
+            
+      - name: Install Tools
+        shell: bash
+        run: |
+            
+            curl -sL https://raw.githubusercontent.com/epi052/feroxbuster/main/install-nix.sh | bash
+          
+      - name: Download Chunks Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: output-chunks
+          path: chunks/
+          
+      - name: Debug Matrix Context
+        run: |
+          echo "matrix.chunk_file = ${{ matrix.chunk_file }}"
+          
+      - name: Run tools on Chunks
+        id: run_tool
+        shell: bash
+        env:
+          CHUNK_PATH: ${{ matrix.chunk_file }}
+        run: |
+          set -ex
+          # verify chunk file exists
+          if [ ! -f "$CHUNK_PATH" ]; then
+            echo "::error:: Chunk file '$CHUNK_PATH' not found"
+            ls -R .
+            exit 1
+          fi
+
+          BASENAME=$(basename "$CHUNK_PATH")
+          echo "basename=$BASENAME" >> $GITHUB_OUTPUT
+          OUTPUT_DIR="results"
+          mkdir -p "$OUTPUT_DIR"
+          OUTPUT_FILE="$OUTPUT_DIR/result_${BASENAME}"
+          echo "Running httpx on $CHUNK_PATH → $OUTPUT_FILE"
+          PUBLIC_IP=$(curl -s https://api.ipify.org) && echo "The public IP of this runner is: $PUBLIC_IP"
+         
+      - name: Compute Safe Chunk Name
+        id: safe_chunk
+        run: |
+          SAFE_CHUNK="$(echo "${{ matrix.chunk_file }}" | tr '/' '_')"
+          echo "safe_chunk=$SAFE_CHUNK" >> $GITHUB_OUTPUT
+          
+      - name: Upload Individual Result Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: result-${{ steps.safe_chunk.outputs.safe_chunk }}
+          path: ${{ steps.run_tool.outputs.output_file }}
+          retention-days: 1
+
+  aggregate-results:
+    needs: run-tools-in-parallel
+    if: always() # This ensures the aggregation job runs even if some nuclei jobs fail
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create Temporary Directory for Results
+        run: mkdir -p temp-results
+
+      - name: Download All Result Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: temp-results/
+          pattern: result-*
+          merge-multiple: true
+
+      - name: Aggregate All Results into a Single File
+        id: aggregate
+        run: |
+          echo "Aggregating all results..."
+          
+          # Combine all downloaded result files into one.
+          # The `sort -u` command will also remove any duplicate findings.
+          
+          cat temp-results/* | sort -u > nuclei-final-results.txt
+          echo "Final aggregated results created at nuclei-final-results.txt"
+          echo "Total unique findings: $(wc -l < nuclei-final-results.txt)"
+          
+      - name: Upload Final Aggregated Results
+        uses: actions/upload-artifact@v4
+        with:
+          name: final-nuclei-results
+          path: nuclei-final-results.txt
+          retention-days: 1
